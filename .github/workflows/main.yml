@@ -1,111 +1,164 @@
-name: Terraform CI/CD
+name: Terraform CI/CD — Multi-Account
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
-  workflow_dispatch:
-    inputs:
-      action:
-        description: "Terraform action"
-        required: true
-        default: "plan"
-        type: choice
-        options:
-          - plan
-          - apply
-          - destroy
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write          # OIDC to assume IAM role in target AWS account
+  pull-requests: write     # Post plan as PR comment
 
 jobs:
-  terraform:
-    name: Terraform
+  detect-changes:
+    name: Detect changed environments
     runs-on: ubuntu-latest
-    environment: terraform-pipeline
-    permissions:
-      contents: read
-      pull-requests: write
+    outputs:
+      environments: ${{ steps.detect.outputs.environments }}
+      has_changes:  ${{ steps.detect.outputs.has_changes }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Configure AWS credentials
+      - name: Detect which environments were modified
+        id: detect
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.sha }}"
+          fi
+
+          CHANGED_PATHS=$(git diff --name-only "$BASE"..."$HEAD")
+          MODULES_CHANGED=$(echo "$CHANGED_PATHS" | grep -c '^modules/' || true)
+
+          # If shared modules changed, trigger all environments
+          if [ "$MODULES_CHANGED" -gt 0 ]; then
+            ALL_ENVS=$(ls -d multi-acc-infra-provision/*/ | xargs -n1 basename | jq -R -s -c 'split("\n")[:-1]')
+            CHANGED_ENVS="$ALL_ENVS"
+          else
+            CHANGED_ENVS=$(echo "$CHANGED_PATHS" \
+              | grep '^multi-acc-infra-provision/' \
+              | cut -d'/' -f2 \
+              | sort -u \
+              | jq -R -s -c 'split("\n")[:-1]')
+          fi
+
+          echo "environments=$CHANGED_ENVS" >> "$GITHUB_OUTPUT"
+          echo "has_changes=$([ "$CHANGED_ENVS" = "[]" ] && echo "false" || echo "true")" >> "$GITHUB_OUTPUT"
+
+  plan:
+    name: 🌱 Terraform Plan (${{ matrix.env }})
+    needs: detect-changes
+    if: >
+      github.event_name == 'pull_request'
+      && needs.detect-changes.outputs.has_changes == 'true'
+    strategy:
+      matrix:
+        env: ${{ fromJson(needs.detect-changes.outputs.environments) }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: multi-acc-infra-provision/${{ matrix.env }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # GitHub Variables are case-sensitive — uppercase env name for lookup
+      - name: Derive uppercase env name
+        id: env-upper
+        run: echo "name=${{ matrix.env }}" | tr '[:lower:]' '[:upper:]' >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
-          aws-region: us-east-1   
+          role-to-assume: ${{ vars[format('AWS_ROLE_{0}', steps.env-upper.outputs.name)] }}
+          aws-region: us-east-1
+          role-session-name: terraform-plan-${{ matrix.env }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.13.3  
+          terraform_version: 1.13.3
 
       - name: Terraform Init
-        run: |
-          terraform init \
-            -backend-config="bucket=terraform-backend-chinna-123" \
-            -backend-config="key=terraform/terraform.tfstate" \
-            -backend-config="region=us-east-2"
+        run: terraform init
 
       - name: Terraform Validate
         run: terraform validate -no-color
 
-      # -----------------------
-      # PLAN
-      # -----------------------
       - name: Terraform Plan
-        if: github.event.inputs.action == 'plan' || github.event_name == 'pull_request'
         id: plan
         run: terraform plan -no-color -input=false -out=tfplan.txt | tee plan_output.txt
 
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.env }}
+          path: multi-acc-infra-provision/${{ matrix.env }}/tfplan.txt
+
       - name: Comment Plan on PR
-        if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@v2
         with:
-          path: plan_output.txt
+          header: tfplan-${{ matrix.env }}
+          path: multi-acc-infra-provision/${{ matrix.env }}/plan_output.txt
 
-  # -----------------------
-  # APPLY (requires approval)
-  # -----------------------
   apply:
-    name: Terraform Apply
+    name: 🚀 Terraform Apply (${{ matrix.env }})
+    needs: detect-changes
+    if: >
+      github.event_name == 'push'
+      && github.ref == 'refs/heads/main'
+      && needs.detect-changes.outputs.has_changes == 'true'
+    strategy:
+      matrix:
+        env: ${{ fromJson(needs.detect-changes.outputs.environments) }}
     runs-on: ubuntu-latest
-    needs: terraform
-    if: github.event.inputs.action == 'apply'
+
+    # Each env has its own approval gate
     environment:
-      name: terraform-apply   # <-- requires approval in GitHub Settings
+      name: terraform-apply-${{ matrix.env }}
+
+    defaults:
+      run:
+        working-directory: multi-acc-infra-provision/${{ matrix.env }}
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Derive uppercase env name
+        id: env-upper
+        run: echo "name=${{ matrix.env }}" | tr '[:lower:]' '[:upper:]' >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars[format('AWS_ROLE_{0}', steps.env-upper.outputs.name)] }}
+          aws-region: us-east-1
+          role-session-name: terraform-apply-${{ matrix.env }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.13.3  
+          terraform_version: 1.13.3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -input=false -out=tfplan.txt | tee plan_output.txt
+
+      - name: Upload Apply Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-apply-${{ matrix.env }}
+          path: multi-acc-infra-provision/${{ matrix.env }}/tfplan.txt
 
       - name: Terraform Apply
-        run: terraform apply -input=false
-
-  # -----------------------
-  # DESTROY (requires approval)
-  # -----------------------
-  destroy:
-    name: Terraform Destroy
-    runs-on: ubuntu-latest
-    needs: terraform
-    if: github.event.inputs.action == 'destroy'
-    environment:
-      name: terraform-destroy   # <-- requires approval in GitHub Settings
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.13.3  
-
-      - name: Terraform Destroy
-        run: terraform destroy -input=false
+        run: terraform apply -input=false tfplan.txt
