@@ -12,6 +12,7 @@ module "vpc" {
   availability_zones   = var.availability_zones
 }
 
+
 module "ec2" {
   source = "../../modules/ec2"
 
