@@ -4,9 +4,9 @@
 
 terraform {
   backend "s3" {
-    bucket       = "terraform-backend-chinna-123"
-    key          = "multi-acc/dev/terraform.tfstate"
-    region       = "us-east-2"
+    bucket       = "macrobowl"
+    key          = "dev/terraform.tfstate"
+    region       = "ap-southeast-1"
     use_lockfile = true
   }
 }
